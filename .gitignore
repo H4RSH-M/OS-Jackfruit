@@ -1,1 +1,28 @@
-solved
+# Compiled User-Space Binaries
+boilerplate/engine
+boilerplate/cpu_hog
+boilerplate/memory_hog
+boilerplate/io_pulse
+
+# Compiled Object Files
+*.o
+
+# Linux Kernel Module Build Artifacts
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+modules.order
+Module.symvers
+.*.cmd
+.tmp_versions/
+
+# Runtime / Extracted Directories
+boilerplate/logs/
+boilerplate/rootfs-*/
+*.tar.gz
+
+# OS / Editor Junk
+.DS_Store
+*.swp
+*~

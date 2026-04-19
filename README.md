@@ -1,93 +1,64 @@
-# Multi-Container Runtime
+# Supervised Multi-Container Runtime & Kernel Monitor
+**Authors:** Harsh M & Chiranthan S, 4-J
 
-A lightweight Linux container runtime in C with a long-running supervisor and a kernel-space memory monitor.
+## 1. System Architecture & Namespace Isolation (Tasks 1 & 2)
+The foundation of this container runtime relies on leveraging Linux namespaces and the `clone()` system call to create isolated user-space environments.
 
-Read [`project-guide.md`](project-guide.md) for the full project specification.
+* **Process & Mount Isolation:** When launching a container, the runtime uses `CLONE_NEWPID` to give the container its own isolated process tree (making its init process PID 1 from its perspective), `CLONE_NEWNS` to isolate the mount namespace, and `CLONE_NEWUTS` to allow a custom hostname. 
+* **Filesystem Rooting:** The child process utilizes `chroot()` to trap the execution context within a designated directory (e.g., `rootfs-alpha`), followed by mounting a fresh virtual `/proc` filesystem so commands like `ps` function correctly inside the container.
+* **Control Plane (IPC):** Communication between the CLI client and the long-running supervisor daemon is handled via UNIX Domain Sockets (`/tmp/mini_runtime.sock`). This allows asynchronous, stateful management of containers.
 
----
+## 2. Concurrency: Bounded-Buffer Logging (Task 3)
+To prevent terminal output corruption from multiple concurrent containers, the runtime implements a thread-safe Producer-Consumer logging pipeline.
 
-## Getting Started
+* **IPC via Pipes:** The `stdout` and `stderr` of the child process are redirected into the write-end of a `pipe()` using `dup2()`.
+* **The Bounded Buffer:** A circular array protected by synchronization primitives safely passes log chunks between threads. 
+* **Synchronization Strategy:** We utilized a single `pthread_mutex_t` alongside two condition variables (`pthread_cond_t not_empty`, `not_full`). This ensures:
+    1.  *Producers* block when the buffer is full without burning CPU cycles.
+    2.  *The Consumer* blocks when the buffer is empty.
+    3.  Data integrity is maintained without race conditions when multiple containers push logs simultaneously.
 
-### 1. Fork the Repository
+## 3. Kernel Space Memory Enforcement (Task 4)
+User-space tools cannot reliably enforce memory limits in real-time. To handle this, we developed a Linux Kernel Module (LKM) that registers container PIDs via `ioctl` and monitors their Resident Set Size (RSS) using a hardware timer interrupt.
 
-1. Go to [github.com/shivangjhalani/OS-Jackfruit](https://github.com/shivangjhalani/OS-Jackfruit)
-2. Click **Fork** (top-right)
-3. Clone your fork:
+* **Synchronization Primitive Justification (Spinlock vs. Mutex):**
+    We fundamentally *must* use a kernel Spinlock (`DEFINE_SPINLOCK`) rather than a Mutex to protect our global linked list of monitored containers. The memory checks occur inside a kernel timer callback (`timer_callback`). Timer callbacks execute in an interrupt context (softirq). In an interrupt context, the kernel is strictly forbidden from sleeping or blocking. If we used a Mutex and the lock was contested, the kernel would attempt to put the thread to sleep, causing a complete system panic/crash. Spinlocks ensure the thread "spins" (busy-waits) safely without yielding the CPU.
+* **Enforcement:** Every second, the timer iterates through the list. If a process breaches the soft limit, a `KERN_WARNING` is logged. If it breaches the hard limit, the kernel sends an immediate `SIGKILL` to the process.
 
-```bash
-git clone https://github.com/<your-username>/OS-Jackfruit.git
-cd OS-Jackfruit
-```
+## 4. CPU Scheduler Analysis (Task 5)
+To verify that the runtime can manipulate the Completely Fair Scheduler (CFS), we exposed the `--nice` flag, applied to containers via the `setpriority()` syscall.
 
-### 2. Set Up Your VM
+**Experiment Methodology:**
+Two CPU-bound containers (`cpu_hog`) were launched simultaneously. Container Alpha was assigned highest priority (Nice: -20), while Container Beta was assigned the lowest priority (Nice: 19). 
 
-You need an **Ubuntu 22.04 or 24.04** VM with **Secure Boot OFF**. WSL will not work.
+To prevent the multi-core Linux host from simply assigning the processes to different CPU cores (which would allow both to run at 100%), the supervisor daemon was pinned to CPU Core 0 using `taskset -c 0`. 
 
-Install dependencies:
+**Results:**
+As proven in the attached `top` screenshot, forcing the processes to compete for a single core allowed the CFS to strictly enforce the priority weights. The -20 process aggressively preempted the 19 process, resulting in near-total CPU starvation for the lower-priority container.
 
-```bash
-sudo apt update
-sudo apt install -y build-essential linux-headers-$(uname -r)
-```
+## 5. Lifecycle Management & Resource Cleanup (Task 6)
+Preventing resource leaks is critical in both user-space and kernel-space.
 
-### 3. Run the Environment Check
+* **Zombie Prevention:** The supervisor runs a non-blocking `waitpid(-1, &status, WNOHANG)` loop. When a container dies (naturally or via kernel assassination), the supervisor immediately reaps the exit status, preventing zombie processes.
+* **Unregistration:** Upon reaping, the supervisor explicitly sends a `MONITOR_UNREGISTER` command to the kernel module to stop tracking the dead PID, preventing memory bloat in the kernel linked list.
+* **Graceful Teardown:** When the `stop daemon` command is received, the supervisor signals all condition variables to wake sleeping threads, joins the logger thread, destroys the mutexes/buffers, and closes the `ioctl` file descriptor.
+* **Kernel Cleanup:** Upon module unload (`rmmod`), `monitor_exit` safely halts the timer and iterates through `list_for_each_entry_safe` to `kfree()` all remaining nodes before deleting the character device.
 
-```bash
-cd boilerplate
-chmod +x environment-check.sh
-sudo ./environment-check.sh
-```
+***
 
-Fix any issues reported before moving on.
+### Evaluation Proof (Screenshots)
 
-### 4. Prepare the Root Filesystem
+* **Task 1: Namespace Isolation & Process Control**
+  ![Task 1](screenshots/task1.png)
 
-```bash
-mkdir rootfs-base
-wget https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz
-tar -xzf alpine-minirootfs-3.20.3-x86_64.tar.gz -C rootfs-base
+* **Task 2: IPC & Daemon Supervision**
+  ![Task 2](screenshots/task2.png)
 
-# Make one writable copy per container you plan to run
-cp -a ./rootfs-base ./rootfs-alpha
-cp -a ./rootfs-base ./rootfs-beta
-```
+* **Task 3: Bounded-Buffer Logging**
+  ![Task 3](screenshots/task3.png)
 
-Do not commit `rootfs-base/` or `rootfs-*` directories to your repository.
+* **Task 4: Kernel Space Memory Limits**
+  ![Task 4](screenshots/task4.png)
 
-### 5. Understand the Boilerplate
-
-The `boilerplate/` folder contains starter files:
-
-| File                   | Purpose                                             |
-| ---------------------- | --------------------------------------------------- |
-| `engine.c`             | User-space runtime and supervisor skeleton          |
-| `monitor.c`            | Kernel module skeleton                              |
-| `monitor_ioctl.h`      | Shared ioctl command definitions                    |
-| `Makefile`             | Build targets for both user-space and kernel module |
-| `cpu_hog.c`            | CPU-bound test workload                             |
-| `io_pulse.c`           | I/O-bound test workload                             |
-| `memory_hog.c`         | Memory-consuming test workload                      |
-| `environment-check.sh` | VM environment preflight check                      |
-
-Use these as your starting point. You are free to restructure the repository however you want — the submission requirements are listed in the project guide.
-
-### 6. Build and Verify
-
-```bash
-cd boilerplate
-make
-```
-
-If this compiles without errors, your environment is ready.
-
----
-
-## What to Do Next
-
-Read [`project-guide.md`](project-guide.md) end to end. It contains:
-
-- The six implementation tasks (multi-container runtime, CLI, logging, kernel monitor, scheduling experiments, cleanup)
-- The engineering analysis you must write
-- The exact submission requirements, including what your `README.md` must contain (screenshots, analysis, design decisions)
-
-Your fork's `README.md` should be replaced with your own project documentation as described in the submission package section of the project guide. (As in get rid of all the above content and replace with your README.md)
+* **Task 5: CPU Scheduler Priority Enforcement**
+  ![Task 5](screenshots/task5.png)
